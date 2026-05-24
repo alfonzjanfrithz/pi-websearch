@@ -20,7 +20,9 @@ import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   formatSize,
+  keyHint,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { writeFileSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -405,6 +407,38 @@ export default function webSearchExtension(pi: ExtensionAPI) {
         details: { provider, query: params.query },
       };
     },
+
+    renderCall(args, theme, _context) {
+      let text = theme.fg("toolTitle", theme.bold("websearch "));
+      text += theme.fg("accent", `"${args.query}"`);
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, { expanded, isPartial }, theme, _context) {
+      if (isPartial) return new Text(theme.fg("warning", "\u23f3 Searching..."), 0, 0);
+
+      const details = result.details as { provider: string; query: string } | undefined;
+      const content = result.content[0];
+      const text = content?.type === "text" ? content.text : "";
+      const lineCount = text.split("\n").length;
+
+      let out = theme.fg("success", "\u2713");
+      out += theme.fg("dim", ` ${lineCount} lines via ${details?.provider ?? "unknown"}`);
+
+      if (expanded) {
+        const lines = text.split("\n").slice(0, 20);
+        for (const line of lines) {
+          out += `\n${theme.fg("dim", line)}`;
+        }
+        if (lineCount > 20) {
+          out += `\n${theme.fg("muted", `... ${lineCount - 20} more lines`)}`;
+        }
+      } else {
+        out += theme.fg("dim", ` (${keyHint("app.tools.expand", "expand")})`);
+      }
+
+      return new Text(out, 0, 0);
+    },
   });
 
   // --- webfetch (same approach as opencode) ---
@@ -458,6 +492,46 @@ export default function webSearchExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text: truncateOutput(result.content) }],
         details: { url: params.url, format, contentType: result.contentType },
       };
+    },
+
+    renderCall(args, theme, _context) {
+      let text = theme.fg("toolTitle", theme.bold("webfetch "));
+      const url = args.url.length > 80 ? `${args.url.slice(0, 77)}...` : args.url;
+      text += theme.fg("accent", url);
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, { expanded, isPartial }, theme, _context) {
+      if (isPartial) return new Text(theme.fg("warning", "\u23f3 Fetching..."), 0, 0);
+
+      const details = result.details as { url: string; format: string; contentType: string; isImage?: boolean } | undefined;
+      const content = result.content[0];
+      const text = content?.type === "text" ? content.text : "";
+
+      // Image result
+      if (details?.isImage) {
+        return new Text(theme.fg("success", "\u2713 Image fetched"), 0, 0);
+      }
+
+      const byteSize = Buffer.byteLength(text, "utf8");
+      const lineCount = text.split("\n").length;
+
+      let out = theme.fg("success", "\u2713");
+      out += theme.fg("dim", ` ${formatSize(byteSize)} ${details?.format ?? "markdown"} (${lineCount} lines)`);
+
+      if (expanded) {
+        const lines = text.split("\n").slice(0, 20);
+        for (const line of lines) {
+          out += `\n${theme.fg("dim", line)}`;
+        }
+        if (lineCount > 20) {
+          out += `\n${theme.fg("muted", `... ${lineCount - 20} more lines`)}`;
+        }
+      } else {
+        out += theme.fg("dim", ` (${keyHint("app.tools.expand", "expand")})`);
+      }
+
+      return new Text(out, 0, 0);
     },
   });
 }
