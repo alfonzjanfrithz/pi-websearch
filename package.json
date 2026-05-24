@@ -1,5 +1,5 @@
 {
-  "name": "pi-websearch",
+  "name": "@alfonzjanfrithz/pi-websearch",
   "version": "0.1.0",
   "description": "Web search and URL content fetching tools for Pi coding agent",
   "keywords": ["pi-package"],
