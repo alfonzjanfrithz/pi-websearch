@@ -206,12 +206,157 @@ function convertHTMLToMarkdown(html: string): string {
   return turndownService.turndown(html)
 }
 
+// ---------------------------------------------------------------------------
+// Structured metadata extraction (Issue #15)
+// ---------------------------------------------------------------------------
+
+interface PageMetadata {
+  title?: string
+  description?: string
+  author?: string
+  publishedDate?: string
+  canonicalUrl?: string
+  image?: string
+  siteName?: string
+  type?: string
+}
+
+function extractMetadata(html: string): PageMetadata {
+  const og: Record<string, string> = {}
+  const meta: Record<string, string> = {}
+  const jsonLdScripts: string[] = []
+  let title = ""
+  let canonical = ""
+
+  const parser = new Parser({
+    onopentag(name, attributes) {
+      if (name === "meta") {
+        const prop = attributes.property
+        const nameAttr = attributes.name
+        const content = attributes.content
+        if (prop && content) {
+          og[prop] = content
+        } else if (nameAttr && content) {
+          meta[nameAttr.toLowerCase()] = content
+        }
+      } else if (name === "title") {
+        // will collect text in ontext
+      } else if (name === "link" && attributes.rel === "canonical" && attributes.href) {
+        canonical = attributes.href
+      } else if (name === "script" && attributes.type === "application/ld+json") {
+        // will collect text in ontext
+      }
+    },
+    ontext(text) {
+      const currentTag = (parser as unknown as { _tagname?: string })._tagname
+      if (currentTag === "title") {
+        title = text
+      }
+      // htmlparser2 doesn't expose current tag easily in ontext,
+      // so we handle JSON-LD by finding script blocks in raw html instead.
+    },
+  })
+
+  // Parse meta, title, canonical, og tags
+  parser.write(html)
+  parser.end()
+
+  // Extract title via regex fallback since htmlparser2 ontext is tricky inline
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+  if (titleMatch) {
+    title = titleMatch[1].replace(/\s+/g, " ").trim()
+  }
+
+  // Extract JSON-LD blocks
+  const ldJsonRe = /<script\s+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi
+  let m: RegExpExecArray | null
+  while ((m = ldJsonRe.exec(html)) !== null) {
+    jsonLdScripts.push(m[1].trim())
+  }
+
+  // Parse JSON-LD candidates
+  let jsonLd: Record<string, unknown> | undefined
+  for (const script of jsonLdScripts) {
+    try {
+      const data = JSON.parse(script) as Record<string, unknown> | Record<string, unknown>[]
+      const candidates = Array.isArray(data) ? data : [data]
+      // Prefer Article, NewsArticle, BlogPosting, WebPage schemas
+      const preferred = candidates.find(
+        (c) =>
+          typeof c === "object" &&
+          c !== null &&
+          (["Article", "NewsArticle", "BlogPosting", "WebPage", "Product", "Organization"].includes(
+            String(c["@type"]),
+          )),
+      )
+      jsonLd = preferred ?? candidates[0]
+      if (jsonLd) break
+    } catch {
+      // ignore malformed JSON-LD
+    }
+  }
+
+  // Helper to safely get nested string fields from JSON-LD
+  function ldString(path: string[]): string | undefined {
+    if (!jsonLd) return undefined
+    let current: unknown = jsonLd
+    for (const key of path) {
+      if (current && typeof current === "object" && key in current) {
+        current = (current as Record<string, unknown>)[key]
+      } else {
+        return undefined
+      }
+    }
+    return typeof current === "string" ? current : undefined
+  }
+
+  function ldAuthor(): string | undefined {
+    if (!jsonLd) return undefined
+    const author = jsonLd.author
+    if (typeof author === "string") return author
+    if (author && typeof author === "object") {
+      const name = (author as Record<string, unknown>).name
+      if (typeof name === "string") return name
+    }
+    const creator = jsonLd.creator
+    if (typeof creator === "string") return creator
+    if (creator && typeof creator === "object") {
+      const name = (creator as Record<string, unknown>).name
+      if (typeof name === "string") return name
+    }
+    return undefined
+  }
+
+  function ldImage(): string | undefined {
+    if (!jsonLd) return undefined
+    const image = jsonLd.image
+    if (typeof image === "string") return image
+    if (image && typeof image === "object") {
+      const url = (image as Record<string, unknown>).url
+      if (typeof url === "string") return url
+    }
+    return undefined
+  }
+
+  // Merge with priority: OpenGraph > JSON-LD > HTML meta
+  return {
+    title: og["og:title"] || jsonLd?.headline || title || meta.description || undefined,
+    description: og["og:description"] || jsonLd?.description || meta.description || undefined,
+    author: og["og:article:author"] || ldAuthor() || meta.author || undefined,
+    publishedDate: og["og:article:published_time"] || ldString(["datePublished"]) || meta.date || undefined,
+    canonicalUrl: og["og:url"] || canonical || undefined,
+    image: og["og:image"] || ldImage() || undefined,
+    siteName: og["og:site_name"] || undefined,
+    type: og["og:type"] || (jsonLd ? String(jsonLd["@type"]).toLowerCase() : undefined),
+  }
+}
+
 async function fetchUrl(
   url: string,
   format: "text" | "markdown" | "html",
   timeoutSec?: number,
   signal?: AbortSignal,
-): Promise<{ content: string; contentType: string; isImage: boolean; imageMime?: string; imageBase64?: string }> {
+): Promise<{ content: string; contentType: string; isImage: boolean; imageMime?: string; imageBase64?: string; metadata?: PageMetadata }> {
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     throw new Error("URL must start with http:// or https://")
   }
@@ -296,24 +441,25 @@ async function fetchUrl(
   const text = await response.text()
 
   // Handle content based on requested format and actual content type (same as opencode)
+  const metadata = extractMetadata(text)
   switch (format) {
     case "markdown":
       if (contentType.includes("text/html")) {
-        return { content: convertHTMLToMarkdown(text), contentType, isImage: false }
+        return { content: convertHTMLToMarkdown(text), contentType, isImage: false, metadata }
       }
-      return { content: text, contentType, isImage: false }
+      return { content: text, contentType, isImage: false, metadata }
 
     case "text":
       if (contentType.includes("text/html")) {
-        return { content: extractTextFromHTML(text), contentType, isImage: false }
+        return { content: extractTextFromHTML(text), contentType, isImage: false, metadata }
       }
-      return { content: text, contentType, isImage: false }
+      return { content: text, contentType, isImage: false, metadata }
 
     case "html":
-      return { content: text, contentType, isImage: false }
+      return { content: text, contentType, isImage: false, metadata }
 
     default:
-      return { content: text, contentType, isImage: false }
+      return { content: text, contentType, isImage: false, metadata }
   }
 }
 
@@ -490,7 +636,7 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text", text: truncateOutput(result.content) }],
-        details: { url: params.url, format, contentType: result.contentType },
+        details: { url: params.url, format, contentType: result.contentType, metadata: result.metadata },
       };
     },
 
@@ -504,7 +650,7 @@ export default function webSearchExtension(pi: ExtensionAPI) {
     renderResult(result, { expanded, isPartial }, theme, _context) {
       if (isPartial) return new Text(theme.fg("warning", "\u23f3 Fetching..."), 0, 0);
 
-      const details = result.details as { url: string; format: string; contentType: string; isImage?: boolean } | undefined;
+      const details = result.details as { url: string; format: string; contentType: string; isImage?: boolean; metadata?: PageMetadata } | undefined;
       const content = result.content[0];
       const text = content?.type === "text" ? content.text : "";
 
@@ -518,6 +664,16 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 
       let out = theme.fg("success", "\u2713");
       out += theme.fg("dim", ` ${formatSize(byteSize)} ${details?.format ?? "markdown"} (${lineCount} lines)`);
+
+      // Show metadata summary if available
+      const md = details?.metadata
+      if (md && (md.title || md.author || md.publishedDate)) {
+        const parts: string[] = []
+        if (md.title) parts.push(md.title)
+        if (md.author) parts.push(`by ${md.author}`)
+        if (md.publishedDate) parts.push(md.publishedDate)
+        out += `\n${theme.fg("accent", parts.join(" | "))}`
+      }
 
       if (expanded) {
         const lines = text.split("\n").slice(0, 20);
