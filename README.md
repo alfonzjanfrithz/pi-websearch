@@ -12,7 +12,7 @@ Registers two LLM-callable tools:
 ## Install
 
 ```bash
-pi install npm:pi-websearch
+pi install npm:@alfonzjanfrithz/pi-websearch
 # or from GitHub
 pi install git:github.com/alfonzjanfrithz/pi-websearch
 ```
@@ -57,6 +57,19 @@ Fetch a URL and extract its content.
 | `format` | `"text"` \| `"markdown"` \| `"html"` | no | Output format (default: `"markdown"`) |
 | `timeout` | number | no | Timeout in seconds (max 120) |
 
+**Metadata extraction** — When fetching HTML pages, `webfetch` automatically extracts structured metadata and includes it in the result:
+
+| Field | Source |
+|---|---|
+| `title` | OpenGraph (`og:title`) → JSON-LD `headline` → `<title>` → meta description |
+| `description` | OpenGraph (`og:description`) → JSON-LD `description` → HTML meta description |
+| `author` | OpenGraph (`og:article:author`) → JSON-LD `author`/`creator` → HTML meta author |
+| `publishedDate` | OpenGraph (`og:article:published_time`) → JSON-LD `datePublished` → HTML meta date |
+| `canonicalUrl` | OpenGraph (`og:url`) → `<link rel="canonical">` |
+| `image` | OpenGraph (`og:image`) → JSON-LD `image` |
+| `siteName` | OpenGraph (`og:site_name`) |
+| `type` | OpenGraph (`og:type`) → JSON-LD `@type` |
+
 ## Features
 
 - Direct HTTP fetch with browser-like User-Agent
@@ -64,6 +77,7 @@ Fetch a URL and extract its content.
 - Cloudflare bot detection retry (honest UA fallback)
 - Image support (returned as base64 attachments)
 - Output truncation (50KB / 2000 lines, overflow saved to temp file)
+- Automatic page metadata extraction (OpenGraph, JSON-LD structured data, HTML meta tags)
 
 ## License
 
