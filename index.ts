@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import TurndownService from "turndown";
 import { Parser } from "htmlparser2";
+import { extractText, getMeta, getDocumentProxy } from "unpdf";
 
 // ---------------------------------------------------------------------------
 // Deterministic provider selection (same logic as opencode)
@@ -162,12 +163,16 @@ async function searchParallel(
 // Web fetch (same approach as opencode's webfetch.ts)
 // ---------------------------------------------------------------------------
 
-const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
+const MAX_RESPONSE_SIZE = 10 * 1024 * 1024 // 10MB
 const DEFAULT_FETCH_TIMEOUT = 30 * 1000 // 30 seconds
 const MAX_FETCH_TIMEOUT = 120 * 1000 // 2 minutes
 
 function isImageMime(mime: string): boolean {
   return mime.startsWith("image/") && mime !== "image/svg+xml" && mime !== "image/vnd.fastbidsheet"
+}
+
+function isPdfMime(mime: string): boolean {
+  return mime === "application/pdf"
 }
 
 function extractTextFromHTML(html: string): string {
@@ -204,6 +209,49 @@ function convertHTMLToMarkdown(html: string): string {
   })
   turndownService.remove(["script", "style", "meta", "link"])
   return turndownService.turndown(html)
+}
+
+// ---------------------------------------------------------------------------
+// PDF text extraction
+// ---------------------------------------------------------------------------
+
+interface PdfExtractionResult {
+  text: string
+  pages: number
+  metadata?: PageMetadata
+}
+
+async function extractTextFromPDF(buffer: Buffer): Promise<PdfExtractionResult> {
+  const uint8 = new Uint8Array(buffer)
+  try {
+    const doc = await getDocumentProxy(uint8)
+    const meta = await getMeta(doc)
+    const result = await extractText(doc)
+
+    // Build page-marked text
+    const parts: string[] = []
+    for (let i = 0; i < result.text.length; i++) {
+      const pageText = result.text[i]?.trim()
+      if (pageText) {
+        parts.push(`--- Page ${i + 1} ---`)
+        parts.push(pageText)
+        parts.push("")
+      }
+    }
+
+    const metadata: PageMetadata = {
+      title: meta.info?.Title || undefined,
+      author: meta.info?.Author || undefined,
+    }
+
+    return { text: parts.join("\n").trim(), pages: result.totalPages, metadata }
+  } catch (err: any) {
+    const msg = String(err?.message ?? err)
+    if (msg.toLowerCase().includes("password") || err?.name === "PasswordException") {
+      throw new Error("This PDF is password-protected and cannot be read.")
+    }
+    throw new Error(`Failed to extract text from PDF: ${msg}`)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,16 +465,20 @@ async function fetchUrl(
   // Check content length
   const contentLength = response.headers.get("content-length")
   if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
-    throw new Error("Response too large (exceeds 5MB limit)")
+    throw new Error("Response too large (exceeds 10MB limit)")
   }
 
   const contentType = response.headers.get("content-type") || ""
   const mime = contentType.split(";")[0]?.trim().toLowerCase() || ""
 
+  // Also check URL extension as fallback for PDF detection
+  const urlPath = new URL(url).pathname.toLowerCase()
+  const isPdf = isPdfMime(mime) || urlPath.endsWith(".pdf")
+
   if (isImageMime(mime)) {
     const arrayBuffer = await response.arrayBuffer()
     if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
-      throw new Error("Response too large (exceeds 5MB limit)")
+      throw new Error("Response too large (exceeds 10MB limit)")
     }
     const base64Content = Buffer.from(arrayBuffer).toString("base64")
     return {
@@ -435,6 +487,27 @@ async function fetchUrl(
       isImage: true,
       imageMime: mime,
       imageBase64: base64Content,
+    }
+  }
+
+  if (isPdf) {
+    const arrayBuffer = await response.arrayBuffer()
+    if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
+      throw new Error("Response too large (exceeds 10MB limit)")
+    }
+    const buffer = Buffer.from(arrayBuffer)
+    const pdfResult = await extractTextFromPDF(buffer)
+
+    let content = pdfResult.text
+    if (format === "html") {
+      content = `<pre>${content.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`
+    }
+
+    return {
+      content,
+      contentType,
+      isImage: false,
+      metadata: pdfResult.metadata,
     }
   }
 
@@ -593,8 +666,9 @@ export default function webSearchExtension(pi: ExtensionAPI) {
     name: "webfetch",
     label: "Web Fetch",
     description: [
-      "Fetch and extract the text content of a web page URL.",
+      "Fetch and extract the text content of a web page or PDF URL.",
       "Returns the page content as markdown text.",
+      "PDFs are automatically detected and their text is extracted with page markers.",
       "Use this tool to read specific web pages when you have a URL.",
     ].join("\n"),
     promptSnippet: "Fetch and extract text content from a URL",
