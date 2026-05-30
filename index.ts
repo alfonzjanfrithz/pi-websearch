@@ -1,16 +1,21 @@
 /**
  * Web Search + Web Fetch Extension for Pi
  *
- * Mirrors opencode's approach:
- * - websearch: Exa/Parallel via MCP JSON-RPC (same provider selection logic)
- * - webfetch: direct HTTP fetch + HTML→markdown conversion (same as opencode)
+ * Adapted from opencode's approach:
+ * - websearch: Multiple providers via REST API or MCP JSON-RPC
+ * - webfetch: direct HTTP fetch + HTML→markdown conversion
  *
  * API keys (search only):
+ *   BRAVE_API_KEY       - Brave Search API key (optional)
+ *   TAVILY_API_KEY      - Tavily Search API key (optional)
+ *   GOOGLE_API_KEY      - Google Custom Search JSON API key (optional)
+ *   GOOGLE_CX           - Google Programmable Search Engine ID (optional)
+ *   SEARXNG_BASE_URL    - SearXNG instance base URL (optional)
  *   EXA_API_KEY         - Exa search (optional, works without it)
  *   PARALLEL_API_KEY    - Parallel search (optional, works without it)
  *
  * Override:
- *   PI_WEBSEARCH_PROVIDER=exa|parallel
+ *   PI_WEBSEARCH_PROVIDER=brave|tavily|google|searxng|exa|parallel
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -34,7 +39,53 @@ import { render } from "dom-serializer";
 import { extractText, getMeta, getDocumentProxy } from "unpdf";
 
 // ---------------------------------------------------------------------------
-// Deterministic provider selection (same logic as opencode)
+// Provider types
+// ---------------------------------------------------------------------------
+
+type ProviderName = "brave" | "tavily" | "google" | "searxng" | "exa" | "parallel";
+
+interface SearchProvider {
+  name: ProviderName;
+  isAvailable(): boolean;
+  search(query: string, numResults: number, sessionId: string, signal?: AbortSignal): Promise<string>;
+}
+
+class SearchError extends Error {
+  constructor(message: string, public readonly code: string) {
+    super(message);
+    this.name = "SearchError";
+  }
+}
+
+class SearchAuthError extends SearchError {
+  constructor(provider: string, status: number) {
+    super(`${provider} API key invalid or expired (HTTP ${status})`, "AUTH_ERROR");
+    this.name = "SearchAuthError";
+  }
+}
+
+class SearchRateLimitError extends SearchError {
+  constructor(provider: string) {
+    super(`${provider} rate limit exceeded`, "RATE_LIMIT");
+    this.name = "SearchRateLimitError";
+  }
+}
+
+class SearchServerError extends SearchError {
+  constructor(provider: string, status: number) {
+    super(`${provider} search service error (HTTP ${status})`, "SERVER_ERROR");
+    this.name = "SearchServerError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Provider priority (higher = tried first during auto-selection and fallback)
+// ---------------------------------------------------------------------------
+
+const PROVIDER_PRIORITY: ProviderName[] = ["brave", "tavily", "google", "searxng", "exa", "parallel"];
+
+// ---------------------------------------------------------------------------
+// Deterministic provider selection
 // ---------------------------------------------------------------------------
 
 function checksum(input: string): string | undefined {
@@ -45,14 +96,61 @@ function checksum(input: string): string | undefined {
   return Math.abs(hash).toString(36);
 }
 
-function selectSearchProvider(sessionId: string): "exa" | "parallel" {
-  const override = process.env.PI_WEBSEARCH_PROVIDER;
-  if (override === "exa" || override === "parallel") return override;
+function isProviderName(value: string): value is ProviderName {
+  return PROVIDER_PRIORITY.includes(value as ProviderName);
+}
 
-  // Deterministic hash split (same as opencode) — both providers
-  // work on free tiers without API keys via MCP.
+function getAvailableProviders(): ProviderName[] {
+  const available: ProviderName[] = [];
+  if (process.env.BRAVE_API_KEY) available.push("brave");
+  if (process.env.TAVILY_API_KEY) available.push("tavily");
+  if (process.env.GOOGLE_API_KEY && process.env.GOOGLE_CX) available.push("google");
+  if (process.env.SEARXNG_BASE_URL) available.push("searxng");
+  available.push("exa", "parallel"); // always available
+  return available;
+}
+
+function selectSearchProvider(sessionId: string): ProviderName {
+  const override = process.env.PI_WEBSEARCH_PROVIDER;
+  if (override && isProviderName(override)) return override;
+
+  const available = getAvailableProviders();
+
+  // If user configured keys for premium providers, pick the highest-priority available one
+  for (const p of PROVIDER_PRIORITY) {
+    if (available.includes(p) && p !== "exa" && p !== "parallel") {
+      return p;
+    }
+  }
+
+  // No premium keys: deterministic hash split between Exa and Parallel (same as opencode)
   const hash = Number.parseInt(checksum(sessionId) ?? "0", 36);
   return hash % 2 === 0 ? "exa" : "parallel";
+}
+
+function getFallbackChain(preferred: ProviderName): ProviderName[] {
+  const available = getAvailableProviders();
+  // Remove preferred, keep rest in priority order
+  return PROVIDER_PRIORITY.filter((p) => p !== preferred && available.includes(p));
+}
+
+// ---------------------------------------------------------------------------
+// Result formatter
+// ---------------------------------------------------------------------------
+
+function formatSearchResults(results: Array<{ title: string; url: string; snippet?: string; content?: string }>): string {
+  if (results.length === 0) return "No search results found.";
+  const lines: string[] = [];
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    lines.push(`${i + 1}. [${r.title}](${r.url})`);
+    const text = r.content || r.snippet || "";
+    if (text) {
+      lines.push(text.trim());
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +221,33 @@ async function mcpCall(
 }
 
 // ---------------------------------------------------------------------------
+// REST search helpers
+// ---------------------------------------------------------------------------
+
+async function safeFetch(url: string, init: RequestInit, provider: string): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MCP_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    if (response.status === 401 || response.status === 403) {
+      throw new SearchAuthError(provider, response.status);
+    }
+    if (response.status === 429) {
+      throw new SearchRateLimitError(provider);
+    }
+    if (response.status >= 500) {
+      throw new SearchServerError(provider, response.status);
+    }
+    if (!response.ok) {
+      throw new SearchError(`${provider} search failed (HTTP ${response.status})`, "HTTP_ERROR");
+    }
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Search providers
 // ---------------------------------------------------------------------------
 
@@ -133,33 +258,169 @@ function exaUrl(): string {
     : "https://mcp.exa.ai/mcp";
 }
 
-async function searchExa(
-  query: string,
-  numResults?: number,
-): Promise<string | undefined> {
-  return mcpCall(exaUrl(), "web_search_exa", {
+async function searchExa(query: string, numResults?: number): Promise<string> {
+  const result = await mcpCall(exaUrl(), "web_search_exa", {
     query,
     type: "auto",
     numResults: numResults ?? 8,
     livecrawl: "fallback",
   });
+  if (!result) throw new SearchError("Exa returned no results", "EMPTY");
+  return result;
 }
 
-async function searchParallel(
-  query: string,
-  sessionId?: string,
-): Promise<string | undefined> {
+async function searchParallel(query: string, sessionId?: string): Promise<string> {
   const headers: Record<string, string> = {
     "User-Agent": "pi-coding-agent",
   };
   const key = process.env.PARALLEL_API_KEY;
   if (key) headers.Authorization = `Bearer ${key}`;
 
-  return mcpCall("https://search.parallel.ai/mcp", "web_search", {
+  const result = await mcpCall("https://search.parallel.ai/mcp", "web_search", {
     objective: query,
     search_queries: [query],
     session_id: sessionId,
   }, headers);
+  if (!result) throw new SearchError("Parallel returned no results", "EMPTY");
+  return result;
+}
+
+async function searchBrave(query: string, numResults?: number): Promise<string> {
+  const key = process.env.BRAVE_API_KEY;
+  if (!key) throw new SearchError("BRAVE_API_KEY not set", "CONFIG");
+
+  const count = Math.min(numResults ?? 8, 20);
+  const url = new URL("https://api.search.brave.com/res/v1/web/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(count));
+  url.searchParams.set("offset", "0");
+  url.searchParams.set("search_lang", "en");
+
+  const response = await safeFetch(url.toString(), {
+    headers: {
+      Accept: "application/json",
+      "X-Subscription-Token": key,
+    },
+  }, "brave");
+
+  const data = await response.json() as {
+    web?: {
+      results?: Array<{ title: string; url: string; description?: string }>;
+    };
+  };
+
+  const results = data.web?.results ?? [];
+  return formatSearchResults(results.map((r) => ({ title: r.title, url: r.url, snippet: r.description })));
+}
+
+async function searchTavily(query: string, numResults?: number): Promise<string> {
+  const key = process.env.TAVILY_API_KEY;
+  if (!key) throw new SearchError("TAVILY_API_KEY not set", "CONFIG");
+
+  const response = await safeFetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      api_key: key,
+      query,
+      search_depth: "basic",
+      max_results: numResults ?? 8,
+      include_answer: false,
+      include_images: false,
+      include_raw_content: false,
+    }),
+  }, "tavily");
+
+  const data = await response.json() as {
+    results?: Array<{ title: string; url: string; content?: string }>;
+  };
+
+  const results = data.results ?? [];
+  return formatSearchResults(results.map((r) => ({ title: r.title, url: r.url, snippet: r.content })));
+}
+
+async function searchGoogle(query: string, numResults?: number): Promise<string> {
+  const key = process.env.GOOGLE_API_KEY;
+  const cx = process.env.GOOGLE_CX;
+  if (!key || !cx) throw new SearchError("GOOGLE_API_KEY and GOOGLE_CX must be set", "CONFIG");
+
+  const num = Math.min(numResults ?? 8, 10);
+  const url = new URL("https://www.googleapis.com/customsearch/v1");
+  url.searchParams.set("key", key);
+  url.searchParams.set("cx", cx);
+  url.searchParams.set("q", query);
+  url.searchParams.set("num", String(num));
+
+  const response = await safeFetch(url.toString(), { headers: { Accept: "application/json" } }, "google");
+
+  const data = await response.json() as {
+    items?: Array<{ title: string; link: string; snippet?: string }>;
+    error?: { message?: string };
+  };
+
+  if (data.error) {
+    throw new SearchError(`Google API error: ${data.error.message ?? "unknown"}`, "API_ERROR");
+  }
+
+  const items = data.items ?? [];
+  return formatSearchResults(items.map((r) => ({ title: r.title, url: r.link, snippet: r.snippet })));
+}
+
+async function searchSearxng(query: string, numResults?: number): Promise<string> {
+  const baseUrl = process.env.SEARXNG_BASE_URL;
+  if (!baseUrl) throw new SearchError("SEARXNG_BASE_URL not set", "CONFIG");
+
+  const url = new URL(`${baseUrl.replace(/\/$/, "")}/search`);
+  url.searchParams.set("q", query);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("categories", "general");
+  url.searchParams.set("pageno", "1");
+  if (numResults) url.searchParams.set("max_results", String(numResults));
+
+  const response = await safeFetch(url.toString(), { headers: { Accept: "application/json" } }, "searxng");
+
+  const data = await response.json() as {
+    results?: Array<{ title: string; url: string; content?: string; snippet?: string }>;
+  };
+
+  const results = data.results ?? [];
+  return formatSearchResults(
+    results.map((r) => ({ title: r.title, url: r.url, snippet: r.content || r.snippet })),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Provider registry
+// ---------------------------------------------------------------------------
+
+function createProvider(name: ProviderName): SearchProvider {
+  return {
+    name,
+    isAvailable() {
+      switch (name) {
+        case "brave": return !!process.env.BRAVE_API_KEY;
+        case "tavily": return !!process.env.TAVILY_API_KEY;
+        case "google": return !!(process.env.GOOGLE_API_KEY && process.env.GOOGLE_CX);
+        case "searxng": return !!process.env.SEARXNG_BASE_URL;
+        case "exa": return true;
+        case "parallel": return true;
+      }
+    },
+    search(query, numResults, sessionId, signal) {
+      if (signal?.aborted) return Promise.reject(new SearchError("Search aborted", "ABORTED"));
+      switch (name) {
+        case "brave": return searchBrave(query, numResults);
+        case "tavily": return searchTavily(query, numResults);
+        case "google": return searchGoogle(query, numResults);
+        case "searxng": return searchSearxng(query, numResults);
+        case "exa": return searchExa(query, numResults);
+        case "parallel": return searchParallel(query, sessionId);
+      }
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -810,25 +1071,74 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const sessionId = ctx.sessionManager.getSessionFile() ?? "default";
-      const provider = selectSearchProvider(sessionId);
+      const preferred = selectSearchProvider(sessionId);
+      const fallbackChain = getFallbackChain(preferred);
+      const providersToTry = [preferred, ...fallbackChain];
 
-      onUpdate?.({
-        content: [
-          { type: "text", text: `Searching via ${provider}: "${params.query}"...` },
-        ],
-      });
+      let lastError: Error | undefined;
 
-      const result =
-        provider === "exa"
-          ? await searchExa(params.query, params.numResults)
-          : await searchParallel(params.query, sessionId);
+      for (const providerName of providersToTry) {
+        if (signal?.aborted) {
+          throw new Error("Search aborted");
+        }
 
-      const output = result ?? "No search results found. Please try a different query.";
+        const provider = createProvider(providerName);
 
-      return {
-        content: [{ type: "text", text: truncateOutput(output) }],
-        details: { provider, query: params.query },
-      };
+        onUpdate?.({
+          content: [
+            { type: "text", text: `Searching via ${providerName}: "${params.query}"...` },
+          ],
+        });
+
+        try {
+          const result = await provider.search(
+            params.query,
+            params.numResults ?? 8,
+            sessionId,
+            signal ?? undefined,
+          );
+
+          return {
+            content: [{ type: "text", text: truncateOutput(result) }],
+            details: { provider: providerName, query: params.query },
+          };
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          const isAuth = err instanceof SearchAuthError;
+          const isRateLimit = err instanceof SearchRateLimitError;
+          const isServer = err instanceof SearchServerError;
+
+          if (isAuth || isRateLimit || isServer) {
+            onUpdate?.({
+              content: [
+                {
+                  type: "text",
+                  text: `⚠ ${lastError.message}. ${providersToTry.indexOf(providerName) < providersToTry.length - 1 ? "Trying next provider..." : ""}`,
+                },
+              ],
+            });
+            // Continue to next provider
+            continue;
+          }
+
+          // For non-recoverable errors (config missing, empty results), also try fallback
+          // unless it's the last provider
+          if (providersToTry.indexOf(providerName) < providersToTry.length - 1) {
+            onUpdate?.({
+              content: [
+                { type: "text", text: `⚠ ${lastError.message}. Trying next provider...` },
+              ],
+            });
+            continue;
+          }
+
+          // Last provider failed
+          throw lastError;
+        }
+      }
+
+      // Should not reach here, but satisfy TypeScript
+      throw lastError ?? new Error("No search providers available");
     },
 
     renderCall(args, theme, _context) {
