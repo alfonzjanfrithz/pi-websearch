@@ -27,7 +27,10 @@ import { writeFileSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import TurndownService from "turndown";
-import { Parser } from "htmlparser2";
+import { Parser, parseDocument } from "htmlparser2";
+import { isTag, type AnyNode, type Element, type Document as DomDocument } from "domhandler";
+import { removeElement, textContent, getElementsByTagName, getChildren, getAttributeValue } from "domutils";
+import { render } from "dom-serializer";
 import { extractText, getMeta, getDocumentProxy } from "unpdf";
 
 // ---------------------------------------------------------------------------
@@ -253,6 +256,122 @@ function convertHTMLToMarkdown(html: string): string {
   })
   turndownService.remove(["script", "style", "meta", "link"])
   return turndownService.turndown(html)
+}
+
+// ---------------------------------------------------------------------------
+// Auto-extract main content from fetched HTML (Issue #21)
+// ---------------------------------------------------------------------------
+
+const NOISE_TAGS = new Set([
+  "nav",
+  "header",
+  "footer",
+  "aside",
+  "form",
+  "script",
+  "style",
+  "noscript",
+  "iframe",
+  "object",
+  "embed",
+])
+
+const NOISE_PATTERNS = [
+  /cookie|consent|gdpr|banner/i,
+  /ad-|ads-|advertisement|promo/i,
+  /sidebar|widget|newsletter|subscribe/i,
+  /social|share-|follow-us/i,
+  /comment|disqus/i,
+  /popup|modal|overlay/i,
+]
+
+function isNoiseElement(node: AnyNode): boolean {
+  if (!isTag(node)) return false
+  const tag = node.name.toLowerCase()
+  if (NOISE_TAGS.has(tag)) return true
+  const id = getAttributeValue(node, "id") || ""
+  const cls = getAttributeValue(node, "class") || ""
+  const combined = `${id} ${cls}`
+  return NOISE_PATTERNS.some((p) => p.test(combined))
+}
+
+function removeNoiseNodes(node: AnyNode): void {
+  if (!isTag(node)) return
+  const children = getChildren(node).slice()
+  for (const child of children) {
+    if (isNoiseElement(child)) {
+      removeElement(child)
+    } else {
+      removeNoiseNodes(child)
+    }
+  }
+}
+
+function extractMainContent(doc: DomDocument): AnyNode[] {
+  const articles = getElementsByTagName("article", doc)
+  const mains = getElementsByTagName("main", doc)
+  const semantic: AnyNode[] = []
+  if (articles.length > 0) semantic.push(...articles)
+  if (mains.length > 0) semantic.push(...mains)
+  if (semantic.length > 0) {
+    return semantic
+  }
+
+  // Fallback heuristic: recursively find the block-level element with
+  // the highest text-to-tag density inside <body>.
+  const body = getElementsByTagName("body", doc)[0]
+  if (!body) return [doc]
+
+  let best: Element | null = null
+  let bestScore = 0
+
+  function walk(node: AnyNode): void {
+    if (!isTag(node)) return
+    if (isNoiseElement(node)) return
+    const tag = node.name.toLowerCase()
+    if (tag === "div" || tag === "section") {
+      const txt = textContent(node).length
+      // Simple density: text chars / (1 + number of child tags).  We approximate
+      // by counting how many tag children exist.  A higher score means more text
+      // per markup, i.e. likely the main article container.
+      const childTags = getChildren(node).filter((c) => isTag(c)).length
+      const density = txt / (1 + childTags)
+      // Prefer larger containers, but boost by density so a giant wrapper
+      // full of wrappers doesn't win over the actual content div.
+      const score = txt + density * 10
+      if (score > bestScore) {
+        bestScore = score
+        best = node
+      }
+    }
+    for (const child of getChildren(node)) {
+      walk(child)
+    }
+  }
+
+  walk(body)
+
+  return best ? [best] : [doc]
+}
+
+function cleanAndExtractHTML(html: string): string {
+  const doc = parseDocument(html, { lowerCaseAttributeNames: true })
+  // Remove noise from the root down
+  for (const child of getChildren(doc).slice()) {
+    if (isNoiseElement(child)) {
+      removeElement(child)
+    } else {
+      removeNoiseNodes(child)
+    }
+  }
+  const mainNodes = extractMainContent(doc)
+  if (mainNodes.length === 1 && mainNodes[0] === doc) {
+    return render(doc)
+  }
+  const cleaned = render(mainNodes)
+  // Never return empty; fallback to original if extraction wiped everything
+  if (!cleaned.trim()) return html
+  return cleaned
 }
 
 // ---------------------------------------------------------------------------
@@ -601,13 +720,15 @@ async function fetchUrl(
   switch (format) {
     case "markdown":
       if (contentType.includes("text/html")) {
-        return { content: convertHTMLToMarkdown(text), contentType, isImage: false, metadata }
+        const cleaned = cleanAndExtractHTML(text)
+        return { content: convertHTMLToMarkdown(cleaned), contentType, isImage: false, metadata }
       }
       return { content: text, contentType, isImage: false, metadata }
 
     case "text":
       if (contentType.includes("text/html")) {
-        return { content: extractTextFromHTML(text), contentType, isImage: false, metadata }
+        const cleaned = cleanAndExtractHTML(text)
+        return { content: extractTextFromHTML(cleaned), contentType, isImage: false, metadata }
       }
       return { content: text, contentType, isImage: false, metadata }
 
