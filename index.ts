@@ -16,6 +16,11 @@
  *
  * Override:
  *   PI_WEBSEARCH_PROVIDER=brave|tavily|google|searxng|exa|parallel
+ *
+ * Cache (Issue #2):
+ *   PI_WEBSEARCH_CACHE_TTL  - Cache TTL in seconds (default: 300 / 5 minutes, 0 = disabled)
+ *   PI_WEBSEARCH_CACHE_MAX  - Max cached search results (default: 100)
+ *   PI_WEBSEARCH_CACHE      - Set to "off" to disable caching entirely
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -280,6 +285,60 @@ function getFallbackChain(preferred: ProviderName): ProviderName[] {
   const available = getAvailableProviders();
   // Remove preferred, keep rest in priority order
   return PROVIDER_PRIORITY.filter((p) => p !== preferred && available.includes(p));
+}
+
+// ---------------------------------------------------------------------------
+// Search result cache (Issue #2: TTL-based caching with LRU eviction)
+// ---------------------------------------------------------------------------
+
+interface CacheEntry {
+  rawResult: string;       // pre-truncation result so re-reads get fresh temp files
+  details: Record<string, unknown>;
+  timestamp: number;       // Date.now() when cached
+}
+
+class SearchCache {
+  private cache = new Map<string, CacheEntry>();
+
+  constructor(
+    private readonly enabled: boolean,
+    private readonly ttlMs: number,
+    private readonly maxEntries: number,
+  ) {}
+
+  private makeKey(provider: string, query: string, dateRange: string | undefined, numResults: number): string {
+    return `${provider}:${query.toLowerCase().trim()}:${dateRange ?? "none"}:${numResults}`;
+  }
+
+  get(provider: string, query: string, dateRange: string | undefined, numResults: number): CacheEntry | undefined {
+    if (!this.enabled) return undefined;
+    const key = this.makeKey(provider, query, dateRange, numResults);
+    const entry = this.cache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() - entry.timestamp >= this.ttlMs) {
+      this.cache.delete(key);
+      return undefined;
+    }
+    // LRU: delete + re-insert moves to end (most recently used)
+    this.cache.delete(key);
+    this.cache.set(key, entry);
+    return entry;
+  }
+
+  set(provider: string, query: string, dateRange: string | undefined, numResults: number, rawResult: string, details: Record<string, unknown>): void {
+    if (!this.enabled) return;
+    const key = this.makeKey(provider, query, dateRange, numResults);
+    if (this.cache.size >= this.maxEntries && !this.cache.has(key)) {
+      // Evict least recently used (first in Map iteration order)
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey !== undefined) this.cache.delete(firstKey);
+    }
+    this.cache.set(key, { rawResult, details, timestamp: Date.now() });
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,6 +1305,17 @@ export default function webSearchExtension(pi: ExtensionAPI) {
   // PI_WEBSEARCH_DATE_RANGE=0 disables the dateRange parameter entirely
   const dateRangeEnabled = process.env.PI_WEBSEARCH_DATE_RANGE !== "0";
 
+  // --- Cache configuration (Issue #2) ---
+  const cacheDisabled = (process.env.PI_WEBSEARCH_CACHE ?? "").toLowerCase() === "off";
+  const cacheTtlRaw = parseInt(process.env.PI_WEBSEARCH_CACHE_TTL ?? "300", 10);
+  const cacheTtlSec = Number.isNaN(cacheTtlRaw) ? 300 : cacheTtlRaw;
+  const cacheMaxEntries = parseInt(process.env.PI_WEBSEARCH_CACHE_MAX ?? "100", 10) || 100;
+  const searchCache = new SearchCache(
+    !cacheDisabled,
+    cacheTtlSec * 1000,   // convert to ms
+    cacheMaxEntries,
+  );
+
   // --- websearch ---
 
   pi.registerTool({
@@ -1286,6 +1356,16 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 
       // Strip dateRange if disabled via environment variable
       const effectiveDateRange = dateRangeEnabled ? (params.dateRange as DateRange | undefined) : undefined;
+      const effectiveNumResults = params.numResults ?? 8;
+
+      // Check cache (Issue #2)
+      const cached = searchCache.get(preferred, params.query, effectiveDateRange, effectiveNumResults);
+      if (cached) {
+        return {
+          content: [{ type: "text", text: truncateOutput(cached.rawResult) }],
+          details: { ...cached.details, cached: true },
+        };
+      }
 
       let lastError: Error | undefined;
 
@@ -1306,15 +1386,19 @@ export default function webSearchExtension(pi: ExtensionAPI) {
         try {
           const result = await provider.search(
             params.query,
-            params.numResults ?? 8,
+            effectiveNumResults,
             sessionId,
             signal ?? undefined,
             effectiveDateRange,
           );
 
+          // Cache the raw (pre-truncation) result (Issue #2)
+          const details = { provider: providerName, query: params.query, dateRange: effectiveDateRange ?? null };
+          searchCache.set(providerName, params.query, effectiveDateRange, effectiveNumResults, result, details);
+
           return {
             content: [{ type: "text", text: truncateOutput(result) }],
-            details: { provider: providerName, query: params.query, dateRange: effectiveDateRange ?? null },
+            details,
           };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
@@ -1373,11 +1457,11 @@ export default function webSearchExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("warning", msg), 0, 0);
       }
 
-      const details = result.details as { provider: string; query: string; dateRange?: string } | undefined;
+      const details = result.details as { provider: string; query: string; dateRange?: string; cached?: boolean } | undefined;
       const lineCount = text.split("\n").length;
 
       let out = theme.fg("success", "\u2713");
-      out += theme.fg("dim", ` ${lineCount} lines via ${details?.provider ?? "unknown"}`);
+      out += theme.fg("dim", ` ${lineCount} lines via ${details?.provider ?? "unknown"}${details?.cached ? " (cached)" : ""}`);
       if (details?.dateRange) {
         out += theme.fg("dim", ` [${DATE_RANGE_LABELS[details.dateRange as DateRange] ?? details.dateRange}]`);
       }

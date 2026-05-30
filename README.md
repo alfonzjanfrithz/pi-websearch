@@ -32,6 +32,9 @@ pi install git:github.com/alfonzjanfrithz/pi-websearch
 | `PARALLEL_API_KEY` | [Parallel](https://parallel.ai) API key | No — works without |
 | `PI_WEBSEARCH_PROVIDER` | Force a provider: `brave`, `tavily`, `google`, `searxng`, `exa`, or `parallel` | No — auto-selects |
 | `PI_WEBSEARCH_DATE_RANGE` | Set to `0` to disable date range filtering entirely | No — enabled by default |
+| `PI_WEBSEARCH_CACHE_TTL` | Cache time-to-live in seconds | No — default: `300` (5 minutes) |
+| `PI_WEBSEARCH_CACHE_MAX` | Maximum number of cached search results | No — default: `100` |
+| `PI_WEBSEARCH_CACHE` | Set to `off` to disable caching entirely | No — enabled by default |
 
 Provider selection logic:
 
@@ -121,6 +124,13 @@ Fetch a URL and extract its content.
 - Image support (returned as base64 attachments)
 - Output truncation (50KB / 2000 lines, overflow saved to temp file)
 - Automatic page metadata extraction (OpenGraph, JSON-LD structured data, HTML meta tags)
+- Search result caching with TTL-based expiry and LRU eviction (Issue #2)
+  - In-memory cache keyed by provider + query + dateRange + numResults
+  - Default 5-minute TTL, configurable via `PI_WEBSEARCH_CACHE_TTL`
+  - Default 100-entry max with LRU eviction, configurable via `PI_WEBSEARCH_CACHE_MAX`
+  - Disable entirely with `PI_WEBSEARCH_CACHE=off`
+  - Cache hits shown in TUI with "(cached)" indicator
+  - Only successful results are cached; errors always fall through to the provider
 
 ## Testing
 
