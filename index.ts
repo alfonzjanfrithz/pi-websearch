@@ -175,6 +175,50 @@ function isPdfMime(mime: string): boolean {
   return mime === "application/pdf"
 }
 
+async function streamResponseToBuffer(
+  response: Response,
+  onUpdate?: (update: { content: Array<{ type: "text"; text: string }> }) => void,
+  label = "Fetching",
+): Promise<Buffer> {
+  if (!response.body) {
+    const ab = await response.arrayBuffer()
+    return Buffer.from(ab)
+  }
+
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let receivedBytes = 0
+  let lastReportedBytes = 0
+  const contentLength = response.headers.get("content-length")
+  const totalBytes = contentLength ? parseInt(contentLength) : undefined
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    chunks.push(value)
+    receivedBytes += value.length
+
+    if (receivedBytes > MAX_RESPONSE_SIZE) {
+      throw new Error("Response too large (exceeds 10MB limit)")
+    }
+
+    if (receivedBytes - lastReportedBytes > 20_000) {
+      let msg: string
+      if (totalBytes && totalBytes > 0) {
+        const pct = Math.round((receivedBytes / totalBytes) * 100)
+        msg = `${label}... ${Math.round(receivedBytes / 1024)} KB / ${Math.round(totalBytes / 1024)} KB (${pct}%)`
+      } else {
+        msg = `${label}... ${Math.round(receivedBytes / 1024)} KB received`
+      }
+      onUpdate?.({ content: [{ type: "text", text: msg }] })
+      lastReportedBytes = receivedBytes
+    }
+  }
+
+  return Buffer.concat(chunks.map((c) => Buffer.from(c)))
+}
+
 function extractTextFromHTML(html: string): string {
   let text = ""
   let skipDepth = 0
@@ -404,6 +448,7 @@ async function fetchUrl(
   format: "text" | "markdown" | "html",
   timeoutSec?: number,
   signal?: AbortSignal,
+  onUpdate?: (update: { content: Array<{ type: "text"; text: string }> }) => void,
 ): Promise<{ content: string; contentType: string; isImage: boolean; imageMime?: string; imageBase64?: string; metadata?: PageMetadata }> {
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     throw new Error("URL must start with http:// or https://")
@@ -476,11 +521,11 @@ async function fetchUrl(
   const isPdf = isPdfMime(mime) || urlPath.endsWith(".pdf")
 
   if (isImageMime(mime)) {
-    const arrayBuffer = await response.arrayBuffer()
-    if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
+    const buffer = await streamResponseToBuffer(response, onUpdate, "Downloading image")
+    if (buffer.byteLength > MAX_RESPONSE_SIZE) {
       throw new Error("Response too large (exceeds 10MB limit)")
     }
-    const base64Content = Buffer.from(arrayBuffer).toString("base64")
+    const base64Content = buffer.toString("base64")
     return {
       content: "Image fetched successfully",
       contentType,
@@ -491,11 +536,11 @@ async function fetchUrl(
   }
 
   if (isPdf) {
-    const arrayBuffer = await response.arrayBuffer()
-    if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
+    const buffer = await streamResponseToBuffer(response, onUpdate, "Downloading PDF")
+    if (buffer.byteLength > MAX_RESPONSE_SIZE) {
       throw new Error("Response too large (exceeds 10MB limit)")
     }
-    const buffer = Buffer.from(arrayBuffer)
+    onUpdate?.({ content: [{ type: "text", text: `Extracting PDF text (${Math.round(buffer.byteLength / 1024)} KB)...` }] })
     const pdfResult = await extractTextFromPDF(buffer)
 
     let content = pdfResult.text
@@ -511,7 +556,45 @@ async function fetchUrl(
     }
   }
 
-  const text = await response.text()
+  let text: string
+
+  if (response.body) {
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let chunks = ""
+    let receivedBytes = 0
+    let lastReportedBytes = 0
+    const totalBytes = contentLength ? parseInt(contentLength) : undefined
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      receivedBytes += value.length
+      if (receivedBytes > MAX_RESPONSE_SIZE) {
+        throw new Error("Response too large (exceeds 10MB limit)")
+      }
+
+      chunks += decoder.decode(value, { stream: true })
+
+      if (receivedBytes - lastReportedBytes > 20_000) {
+        let msg: string
+        if (totalBytes && totalBytes > 0) {
+          const pct = Math.round((receivedBytes / totalBytes) * 100)
+          msg = `Fetching... ${Math.round(receivedBytes / 1024)} KB / ${Math.round(totalBytes / 1024)} KB (${pct}%)`
+        } else {
+          msg = `Fetching... ${Math.round(receivedBytes / 1024)} KB received`
+        }
+        onUpdate?.({ content: [{ type: "text", text: msg }] })
+        lastReportedBytes = receivedBytes
+      }
+    }
+
+    chunks += decoder.decode()
+    text = chunks
+  } else {
+    text = await response.text()
+  }
 
   // Handle content based on requested format and actual content type (same as opencode)
   const metadata = extractMetadata(text)
@@ -687,7 +770,7 @@ export default function webSearchExtension(pi: ExtensionAPI) {
         ],
       });
 
-      const result = await fetchUrl(params.url, format, params.timeout, signal ?? undefined);
+      const result = await fetchUrl(params.url, format, params.timeout, signal ?? undefined, onUpdate);
 
       if (result.isImage && result.imageMime && result.imageBase64) {
         return {
