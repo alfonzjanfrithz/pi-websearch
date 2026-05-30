@@ -717,11 +717,15 @@ export default function webSearchExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, { expanded, isPartial }, theme, _context) {
-      if (isPartial) return new Text(theme.fg("warning", "\u23f3 Searching..."), 0, 0);
-
-      const details = result.details as { provider: string; query: string } | undefined;
       const content = result.content[0];
       const text = content?.type === "text" ? content.text : "";
+
+      if (isPartial) {
+        const msg = text || "\u23f3 Searching...";
+        return new Text(theme.fg("warning", msg), 0, 0);
+      }
+
+      const details = result.details as { provider: string; query: string } | undefined;
       const lineCount = text.split("\n").length;
 
       let out = theme.fg("success", "\u2713");
@@ -805,11 +809,15 @@ export default function webSearchExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, { expanded, isPartial }, theme, _context) {
-      if (isPartial) return new Text(theme.fg("warning", "\u23f3 Fetching..."), 0, 0);
-
-      const details = result.details as { url: string; format: string; contentType: string; isImage?: boolean; metadata?: PageMetadata } | undefined;
       const content = result.content[0];
       const text = content?.type === "text" ? content.text : "";
+
+      if (isPartial) {
+        const msg = text || "\u23f3 Fetching...";
+        return new Text(theme.fg("warning", msg), 0, 0);
+      }
+
+      const details = result.details as { url: string; format: string; contentType: string; isImage?: boolean; metadata?: PageMetadata } | undefined;
 
       // Image result
       if (details?.isImage) {
