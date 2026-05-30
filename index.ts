@@ -43,11 +43,159 @@ import { extractText, getMeta, getDocumentProxy } from "unpdf";
 // ---------------------------------------------------------------------------
 
 type ProviderName = "brave" | "tavily" | "google" | "searxng" | "exa" | "parallel";
+type DateRange = "last_day" | "last_week" | "last_month" | "last_3m" | "last_6m" | "last_9m" | "last_year" | "ytd";
+
+/**
+ * Date range parameter mapping per provider.
+ *
+ * - For providers with preset values (Brave, Tavily, SearXNG), the map
+ *   provides the exact API parameter.
+ * - For providers supporting arbitrary date ranges (Brave custom range,
+ *   Tavily start_date, Google m[N]/d[N], Exa ISO date), the map entry
+ *   may use a special sentinel that triggers runtime date computation
+ *   inside resolveDateParams().
+ * - Providers that don't support date filtering (Parallel) simply
+ *   have an empty record — resolveDateParams() returns {}.
+ * - SearXNG only supports 4 presets (day/week/month/year); intermediate
+ *   ranges fall back to the closest available preset.
+ */
+const DATE_RANGE_MAP: Record<string, Partial<Record<DateRange, Record<string, string>>>> = {
+  brave: {
+    last_day:   { freshness: "pd" },
+    last_week:  { freshness: "pw" },
+    last_month: { freshness: "pm" },
+    last_3m:    { freshness: "__BRAVE_CUSTOM__" },   // computed at runtime
+    last_6m:    { freshness: "__BRAVE_CUSTOM__" },   // computed at runtime
+    last_9m:    { freshness: "__BRAVE_CUSTOM__" },   // computed at runtime
+    last_year:  { freshness: "py" },
+    ytd:        { freshness: "__BRAVE_CUSTOM__" },   // computed at runtime
+  },
+  tavily: {
+    last_day:   { time_range: "day" },
+    last_week:  { time_range: "week" },
+    last_month: { time_range: "month" },
+    last_3m:    { __TAVILY_START_DATE__: "" },      // computed at runtime
+    last_6m:    { __TAVILY_START_DATE__: "" },      // computed at runtime
+    last_9m:    { __TAVILY_START_DATE__: "" },      // computed at runtime
+    last_year:  { time_range: "year" },
+    ytd:        { __TAVILY_START_DATE__: "" },      // computed at runtime
+  },
+  google: {
+    last_day:   { dateRestrict: "d1" },
+    last_week:  { dateRestrict: "w1" },
+    last_month: { dateRestrict: "m1" },
+    last_3m:    { dateRestrict: "m3" },
+    last_6m:    { dateRestrict: "m6" },
+    last_9m:    { dateRestrict: "m9" },
+    last_year:  { dateRestrict: "y1" },
+    ytd:        { dateRestrict: "__GOOGLE_D__" },    // computed at runtime
+  },
+  searxng: {
+    last_day:   { time_range: "day" },
+    last_week:  { time_range: "week" },
+    last_month: { time_range: "month" },
+    last_3m:    { time_range: "month" },              // falls back to closest preset
+    last_6m:    { time_range: "year" },               // falls back to closest preset
+    last_9m:    { time_range: "year" },               // falls back to closest preset
+    last_year:  { time_range: "year" },
+    ytd:        { time_range: "year" },               // falls back to closest preset
+  },
+  // Exa uses ISO date computation — handled by resolveDateParams()
+  exa: {},
+  // Parallel doesn't support date filtering — silently ignored
+  parallel: {},
+};
+
+/** Day offsets for computing ISO date boundaries (Exa-style providers). */
+const DATE_RANGE_DAYS: Record<DateRange, number> = {
+  last_day:   1,
+  last_week:  7,
+  last_month: 30,
+  last_3m:   90,
+  last_6m:   180,
+  last_9m:   270,
+  last_year:  365,
+  ytd:        0,  // computed at runtime
+};
+
+/** Human-readable labels for display in UI. */
+const DATE_RANGE_LABELS: Record<DateRange, string> = {
+  last_day:   "24h",
+  last_week:  "7d",
+  last_month: "30d",
+  last_3m:   "3m",
+  last_6m:   "6m",
+  last_9m:   "9m",
+  last_year:  "1y",
+  ytd:        "YTD",
+};
+
+/** Compute YTD day offset (days since Jan 1 of current year). */
+function ytdDays(): number {
+  const now = new Date();
+  const jan1 = new Date(now.getFullYear(), 0, 1);
+  return Math.floor((now.getTime() - jan1.getTime()) / 86400000);
+}
+
+function toISODate(daysAgo: number): string {
+  return new Date(Date.now() - daysAgo * 86400000).toISOString();
+}
+
+function toBraveDateRange(daysAgo: number): string {
+  const start = new Date(Date.now() - daysAgo * 86400000);
+  const end = new Date();
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+  return `${fmt(start)}to${fmt(end)}`;
+}
+
+function resolveDateParams(provider: string, dateRange?: DateRange): Record<string, unknown> {
+  if (!dateRange) return {};
+
+  // Check for sentinel values that require runtime date computation
+  const preset = DATE_RANGE_MAP[provider]?.[dateRange];
+
+  if (preset && Object.keys(preset).length > 0) {
+    const key = Object.keys(preset)[0]!;
+    const val = preset[key]!;
+
+    // Brave custom date range: compute YYYY-MM-DDtoYYYY-MM-DD
+    if (val === "__BRAVE_CUSTOM__") {
+      const days = dateRange === "ytd" ? ytdDays() : DATE_RANGE_DAYS[dateRange];
+      return { freshness: toBraveDateRange(days) };
+    }
+
+    // Tavily start_date: compute YYYY-MM-DD
+    if (val === "") {
+      const days = dateRange === "ytd" ? ytdDays() : DATE_RANGE_DAYS[dateRange];
+      return { start_date: toISODate(days).slice(0, 10) };
+    }
+
+    // Google YTD: compute d<N> (days since Jan 1)
+    if (val === "__GOOGLE_D__") {
+      return { dateRestrict: `d${ytdDays()}` };
+    }
+
+    // Regular preset
+    return { ...preset };
+  }
+
+  // For providers that need ISO date computation (Exa)
+  // If the provider has an empty entry in DATE_RANGE_MAP, it means
+  // we should compute the ISO date instead.
+  if (provider in DATE_RANGE_MAP) {
+    const days = dateRange === "ytd" ? ytdDays() : DATE_RANGE_DAYS[dateRange];
+    const startDate = new Date(Date.now() - days * 86400000);
+    return { startPublishedDate: startDate.toISOString() };
+  }
+
+  // Unknown provider — no date filtering
+  return {};
+}
 
 interface SearchProvider {
   name: ProviderName;
   isAvailable(): boolean;
-  search(query: string, numResults: number, sessionId: string, signal?: AbortSignal): Promise<string>;
+  search(query: string, numResults: number, sessionId: string, signal: AbortSignal | undefined, dateRange?: DateRange): Promise<string>;
 }
 
 class SearchError extends Error {
@@ -258,24 +406,29 @@ function exaUrl(): string {
     : "https://mcp.exa.ai/mcp";
 }
 
-async function searchExa(query: string, numResults?: number): Promise<string> {
-  const result = await mcpCall(exaUrl(), "web_search_exa", {
+async function searchExa(query: string, numResults?: number, dateRange?: DateRange): Promise<string> {
+  const args: Record<string, unknown> = {
     query,
     type: "auto",
     numResults: numResults ?? 8,
     livecrawl: "fallback",
-  });
+  };
+  const dateParams = resolveDateParams("exa", dateRange);
+  Object.assign(args, dateParams);
+
+  const result = await mcpCall(exaUrl(), "web_search_exa", args);
   if (!result) throw new SearchError("Exa returned no results", "EMPTY");
   return result;
 }
 
-async function searchParallel(query: string, sessionId?: string): Promise<string> {
+async function searchParallel(query: string, sessionId?: string, dateRange?: DateRange): Promise<string> {
   const headers: Record<string, string> = {
     "User-Agent": "pi-coding-agent",
   };
   const key = process.env.PARALLEL_API_KEY;
   if (key) headers.Authorization = `Bearer ${key}`;
 
+  // Parallel doesn't support date filtering — dateRange is silently ignored
   const result = await mcpCall("https://search.parallel.ai/mcp", "web_search", {
     objective: query,
     search_queries: [query],
@@ -285,7 +438,7 @@ async function searchParallel(query: string, sessionId?: string): Promise<string
   return result;
 }
 
-async function searchBrave(query: string, numResults?: number): Promise<string> {
+async function searchBrave(query: string, numResults?: number, dateRange?: DateRange): Promise<string> {
   const key = process.env.BRAVE_API_KEY;
   if (!key) throw new SearchError("BRAVE_API_KEY not set", "CONFIG");
 
@@ -295,6 +448,12 @@ async function searchBrave(query: string, numResults?: number): Promise<string> 
   url.searchParams.set("count", String(count));
   url.searchParams.set("offset", "0");
   url.searchParams.set("search_lang", "en");
+
+  // Apply date range filter
+  const dateParams = resolveDateParams("brave", dateRange);
+  for (const [k, v] of Object.entries(dateParams)) {
+    url.searchParams.set(k, String(v));
+  }
 
   const response = await safeFetch(url.toString(), {
     headers: {
@@ -313,9 +472,22 @@ async function searchBrave(query: string, numResults?: number): Promise<string> 
   return formatSearchResults(results.map((r) => ({ title: r.title, url: r.url, snippet: r.description })));
 }
 
-async function searchTavily(query: string, numResults?: number): Promise<string> {
+async function searchTavily(query: string, numResults?: number, dateRange?: DateRange): Promise<string> {
   const key = process.env.TAVILY_API_KEY;
   if (!key) throw new SearchError("TAVILY_API_KEY not set", "CONFIG");
+
+  const body: Record<string, unknown> = {
+    api_key: key,
+    query,
+    search_depth: "basic",
+    max_results: numResults ?? 8,
+    include_answer: false,
+    include_images: false,
+    include_raw_content: false,
+  };
+
+  // Apply date range filter
+  Object.assign(body, resolveDateParams("tavily", dateRange));
 
   const response = await safeFetch("https://api.tavily.com/search", {
     method: "POST",
@@ -323,15 +495,7 @@ async function searchTavily(query: string, numResults?: number): Promise<string>
       "Content-Type": "application/json",
       Accept: "application/json",
     },
-    body: JSON.stringify({
-      api_key: key,
-      query,
-      search_depth: "basic",
-      max_results: numResults ?? 8,
-      include_answer: false,
-      include_images: false,
-      include_raw_content: false,
-    }),
+    body: JSON.stringify(body),
   }, "tavily");
 
   const data = await response.json() as {
@@ -342,7 +506,7 @@ async function searchTavily(query: string, numResults?: number): Promise<string>
   return formatSearchResults(results.map((r) => ({ title: r.title, url: r.url, snippet: r.content })));
 }
 
-async function searchGoogle(query: string, numResults?: number): Promise<string> {
+async function searchGoogle(query: string, numResults?: number, dateRange?: DateRange): Promise<string> {
   const key = process.env.GOOGLE_API_KEY;
   const cx = process.env.GOOGLE_CX;
   if (!key || !cx) throw new SearchError("GOOGLE_API_KEY and GOOGLE_CX must be set", "CONFIG");
@@ -353,6 +517,12 @@ async function searchGoogle(query: string, numResults?: number): Promise<string>
   url.searchParams.set("cx", cx);
   url.searchParams.set("q", query);
   url.searchParams.set("num", String(num));
+
+  // Apply date range filter
+  const dateParams = resolveDateParams("google", dateRange);
+  for (const [k, v] of Object.entries(dateParams)) {
+    url.searchParams.set(k, String(v));
+  }
 
   const response = await safeFetch(url.toString(), { headers: { Accept: "application/json" } }, "google");
 
@@ -369,7 +539,7 @@ async function searchGoogle(query: string, numResults?: number): Promise<string>
   return formatSearchResults(items.map((r) => ({ title: r.title, url: r.link, snippet: r.snippet })));
 }
 
-async function searchSearxng(query: string, numResults?: number): Promise<string> {
+async function searchSearxng(query: string, numResults?: number, dateRange?: DateRange): Promise<string> {
   const baseUrl = process.env.SEARXNG_BASE_URL;
   if (!baseUrl) throw new SearchError("SEARXNG_BASE_URL not set", "CONFIG");
 
@@ -379,6 +549,12 @@ async function searchSearxng(query: string, numResults?: number): Promise<string
   url.searchParams.set("categories", "general");
   url.searchParams.set("pageno", "1");
   if (numResults) url.searchParams.set("max_results", String(numResults));
+
+  // Apply date range filter
+  const dateParams = resolveDateParams("searxng", dateRange);
+  for (const [k, v] of Object.entries(dateParams)) {
+    url.searchParams.set(k, String(v));
+  }
 
   const response = await safeFetch(url.toString(), { headers: { Accept: "application/json" } }, "searxng");
 
@@ -409,15 +585,15 @@ function createProvider(name: ProviderName): SearchProvider {
         case "parallel": return true;
       }
     },
-    search(query, numResults, sessionId, signal) {
+    search(query, numResults, sessionId, signal, dateRange) {
       if (signal?.aborted) return Promise.reject(new SearchError("Search aborted", "ABORTED"));
       switch (name) {
-        case "brave": return searchBrave(query, numResults);
-        case "tavily": return searchTavily(query, numResults);
-        case "google": return searchGoogle(query, numResults);
-        case "searxng": return searchSearxng(query, numResults);
-        case "exa": return searchExa(query, numResults);
-        case "parallel": return searchParallel(query, sessionId);
+        case "brave": return searchBrave(query, numResults, dateRange);
+        case "tavily": return searchTavily(query, numResults, dateRange);
+        case "google": return searchGoogle(query, numResults, dateRange);
+        case "searxng": return searchSearxng(query, numResults, dateRange);
+        case "exa": return searchExa(query, numResults, dateRange);
+        case "parallel": return searchParallel(query, sessionId, dateRange);
       }
     },
   };
@@ -1032,6 +1208,24 @@ const WebSearchParams = Type.Object({
   numResults: Type.Optional(
     Type.Number({ description: "Number of search results to return (default: 8)" }),
   ),
+  dateRange: Type.Optional(
+    Type.Union(
+      [
+        Type.Literal("last_day"),
+        Type.Literal("last_week"),
+        Type.Literal("last_month"),
+        Type.Literal("last_3m"),
+        Type.Literal("last_6m"),
+        Type.Literal("last_9m"),
+        Type.Literal("last_year"),
+        Type.Literal("ytd"),
+      ],
+      {
+        description:
+          "Filter results by recency: last_day (24h), last_week (7d), last_month (30d), last_3m (90d), last_6m (180d), last_9m (270d), last_year (365d), ytd (year-to-date). Use for time-sensitive queries like news, recent events, or latest updates.",
+      },
+    ),
+  ),
 });
 
 const WebFetchParams = Type.Object({
@@ -1049,6 +1243,9 @@ const WebFetchParams = Type.Object({
 export default function webSearchExtension(pi: ExtensionAPI) {
   const year = new Date().getFullYear();
 
+  // PI_WEBSEARCH_DATE_RANGE=0 disables the dateRange parameter entirely
+  const dateRangeEnabled = process.env.PI_WEBSEARCH_DATE_RANGE !== "0";
+
   // --- websearch ---
 
   pi.registerTool({
@@ -1061,11 +1258,23 @@ export default function webSearchExtension(pi: ExtensionAPI) {
       "",
       `The current year is ${year}. You MUST use this year when searching for recent information or current events.`,
       `Example: If the current year is ${year} and the user asks for "latest AI news", search for "AI news ${year}"`,
+      "",
+      "For time-sensitive queries, use the dateRange parameter to filter results by recency:",
+      '- Use "last_day" for very recent events (today/yesterday)',
+      '- Use "last_week" for recent news and updates (past 7 days)',
+      '- Use "last_month" for trends and changes in the past month',
+      '- Use "last_3m" for results from the past 3 months',
+      '- Use "last_6m" for results from the past 6 months',
+      '- Use "last_9m" for results from the past 9 months',
+      '- Use "last_year" for broader recent history (past 365 days)',
+      '- Use "ytd" for results from the start of the current calendar year',
+      "- Omit dateRange if recency is not important",
     ].join("\n"),
     promptSnippet: "Search the web for current information",
     promptGuidelines: [
       "Use websearch when you need current information beyond your knowledge cutoff.",
       "Always include the current year in search queries about recent events.",
+      "Use dateRange (last_day/last_week/last_month/last_3m/last_6m/last_9m/last_year/ytd) for time-sensitive queries like news or recent updates.",
     ],
     parameters: WebSearchParams,
 
@@ -1074,6 +1283,9 @@ export default function webSearchExtension(pi: ExtensionAPI) {
       const preferred = selectSearchProvider(sessionId);
       const fallbackChain = getFallbackChain(preferred);
       const providersToTry = [preferred, ...fallbackChain];
+
+      // Strip dateRange if disabled via environment variable
+      const effectiveDateRange = dateRangeEnabled ? (params.dateRange as DateRange | undefined) : undefined;
 
       let lastError: Error | undefined;
 
@@ -1084,9 +1296,10 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 
         const provider = createProvider(providerName);
 
+        const dateInfo = effectiveDateRange ? ` [${DATE_RANGE_LABELS[effectiveDateRange] ?? effectiveDateRange}]` : "";
         onUpdate?.({
           content: [
-            { type: "text", text: `Searching via ${providerName}: "${params.query}"...` },
+            { type: "text", text: `Searching via ${providerName}: "${params.query}"${dateInfo}...` },
           ],
         });
 
@@ -1096,11 +1309,12 @@ export default function webSearchExtension(pi: ExtensionAPI) {
             params.numResults ?? 8,
             sessionId,
             signal ?? undefined,
+            effectiveDateRange,
           );
 
           return {
             content: [{ type: "text", text: truncateOutput(result) }],
-            details: { provider: providerName, query: params.query },
+            details: { provider: providerName, query: params.query, dateRange: effectiveDateRange ?? null },
           };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
@@ -1144,6 +1358,9 @@ export default function webSearchExtension(pi: ExtensionAPI) {
     renderCall(args, theme, _context) {
       let text = theme.fg("toolTitle", theme.bold("websearch "));
       text += theme.fg("accent", `"${args.query}"`);
+      if (args.dateRange) {
+        text += theme.fg("dim", ` [${DATE_RANGE_LABELS[args.dateRange] ?? args.dateRange}]`);
+      }
       return new Text(text, 0, 0);
     },
 
@@ -1156,11 +1373,14 @@ export default function webSearchExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("warning", msg), 0, 0);
       }
 
-      const details = result.details as { provider: string; query: string } | undefined;
+      const details = result.details as { provider: string; query: string; dateRange?: string } | undefined;
       const lineCount = text.split("\n").length;
 
       let out = theme.fg("success", "\u2713");
       out += theme.fg("dim", ` ${lineCount} lines via ${details?.provider ?? "unknown"}`);
+      if (details?.dateRange) {
+        out += theme.fg("dim", ` [${DATE_RANGE_LABELS[details.dateRange as DateRange] ?? details.dateRange}]`);
+      }
 
       if (expanded) {
         const lines = text.split("\n").slice(0, 20);

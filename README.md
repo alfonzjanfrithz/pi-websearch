@@ -31,6 +31,7 @@ pi install git:github.com/alfonzjanfrithz/pi-websearch
 | `EXA_API_KEY` | [Exa](https://exa.ai) API key | No — works without |
 | `PARALLEL_API_KEY` | [Parallel](https://parallel.ai) API key | No — works without |
 | `PI_WEBSEARCH_PROVIDER` | Force a provider: `brave`, `tavily`, `google`, `searxng`, `exa`, or `parallel` | No — auto-selects |
+| `PI_WEBSEARCH_DATE_RANGE` | Set to `0` to disable date range filtering entirely | No — enabled by default |
 
 Provider selection logic:
 
@@ -58,6 +59,33 @@ Search the web and return relevant content.
 |---|---|---|---|
 | `query` | string | yes | Search query |
 | `numResults` | number | no | Number of results (default: 8) |
+| `dateRange` | `"last_day" \| "last_week" \| "last_month" \| "last_3m" \| "last_6m" \| "last_9m" \| "last_year" \| "ytd"` | no | Filter results by recency |
+
+**Date range mapping** — Each provider maps `dateRange` to its native API parameter:
+
+| `dateRange` | Label | Brave | Tavily | Google | SearXNG | Exa | Parallel |
+|---|---|---|---|---|---|---|---|
+| `last_day` | 24h | `freshness=pd` | `time_range=day` | `dateRestrict=d1` | `time_range=day` | ISO date (1 day ago) | — |
+| `last_week` | 7d | `freshness=pw` | `time_range=week` | `dateRestrict=w1` | `time_range=week` | ISO date (7 days ago) | — |
+| `last_month` | 30d | `freshness=pm` | `time_range=month` | `dateRestrict=m1` | `time_range=month` | ISO date (30 days ago) | — |
+| `last_3m` | 3m | `freshness=<custom>` ⚠️ | `start_date=<ISO>` | `dateRestrict=m3` | `time_range=month` ⚠️ | ISO date (90 days ago) | — |
+| `last_6m` | 6m | `freshness=<custom>` ⚠️ | `start_date=<ISO>` | `dateRestrict=m6` | `time_range=year` ⚠️ | ISO date (180 days ago) | — |
+| `last_9m` | 9m | `freshness=<custom>` ⚠️ | `start_date=<ISO>` | `dateRestrict=m9` | `time_range=year` ⚠️ | ISO date (270 days ago) | — |
+| `last_year` | 1y | `freshness=py` | `time_range=year` | `dateRestrict=y1` | `time_range=year` | ISO date (365 days ago) | — |
+| `ytd` | YTD | `freshness=<custom>` ⚠️ | `start_date=<ISO>` | `dateRestrict=d<N>` ⚠️ | `time_range=year` ⚠️ | ISO date (Jan 1) | — |
+
+⚠️ = approximate mapping (see notes below)
+
+**Provider-specific date range notes:**
+
+- **Brave**: Intermediate ranges use custom date ranges (`YYYY-MM-DDtoYYYY-MM-DD`). YTD computes from Jan 1 of the current year.
+- **Tavily**: Intermediate ranges and YTD use `start_date` (ISO date) instead of `time_range` presets, which provides exact dates.
+- **Google**: YTD is approximated as `d<N>` (days since Jan 1). All other ranges use native `d[N]`/`w[N]`/`m[N]`/`y[N]` units.
+- **SearXNG**: Only supports 4 presets (`day`/`week`/`month`/`year`). `last_3m` falls back to `month`, `last_6m`/`last_9m`/`ytd` fall back to `year`.
+- **Exa**: All ranges are computed as ISO `startPublishedDate` offsets — fully flexible.
+- **Parallel**: Does not support date filtering. The parameter is silently ignored.
+
+Set `PI_WEBSEARCH_DATE_RANGE=0` to completely disable the `dateRange` parameter (it will be stripped from all requests regardless of what the LLM passes).
 
 ### `webfetch`
 
@@ -85,6 +113,8 @@ Fetch a URL and extract its content.
 ## Features
 
 - 6 search providers with automatic fallback on failure
+- 8 date/recency filters via `dateRange` parameter (last_day, last_week, last_month, last_3m, last_6m, last_9m, last_year, ytd) with provider-specific mapping
+- Disable date range filtering via `PI_WEBSEARCH_DATE_RANGE=0`
 - Direct HTTP fetch with browser-like User-Agent
 - HTML→markdown via `turndown`, text extraction via `htmlparser2`
 - Cloudflare bot detection retry (honest UA fallback)
@@ -93,25 +123,6 @@ Fetch a URL and extract its content.
 - Automatic page metadata extraction (OpenGraph, JSON-LD structured data, HTML meta tags)
 
 ## Testing
-
-A test script is included to verify each provider works:
-
-```bash
-# Test all configured providers
-node test-providers.mjs
-
-# Test a single provider
-node test-providers.mjs brave
-node test-providers.mjs tavily
-node test-providers.mjs google
-node test-providers.mjs searxng
-node test-providers.mjs exa
-node test-providers.mjs parallel
-
-# Test with environment variables inline
-BRAVE_API_KEY=your-key node test-providers.mjs brave
-SEARXNG_BASE_URL=https://your-instance.com node test-providers.mjs searxng
-```
 
 **Note:** Public SearXNG instances often disable the JSON API or rate-limit it. For best results, [self-host SearXNG](https://docs.searxng.org/admin/installation.html) and enable `json` in `settings.yml`:
 
